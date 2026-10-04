@@ -61,6 +61,10 @@
   重新分给该逾期评审人 (求解时该 (评审人, 论文) 对以 review_overdue 排除);
   其余已确认槽位仍按既有规则固定。截止按发布序号隔离: 普通发布/补位发布推进
   序号后旧版截止不约束新发布版 (旧行保留仅供追溯)。
+- migration_restores 表保存实例迁移的恢复标记 (会务方快照迁移): 每次成功恢复
+  写入一行 (快照校验和/格式版本/恢复后的修订号与发布序号/时刻); 恢复仅接受
+  尚无业务记录且从未恢复过的目标实例, 重复恢复拒绝。本表为实例本地元数据,
+  不随快照导出。
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -292,6 +296,18 @@ CREATE TABLE IF NOT EXISTS review_deadlines (
     revision    INTEGER NOT NULL,      -- 设置时核对通过的资料修订号
     deadline_at TEXT NOT NULL,         -- 归一化 UTC ISO 8601 截止时刻 (须晚于设置时刻)
     set_at      TEXT NOT NULL          -- 设置时刻 (归一化 UTC)
+);
+-- 实例迁移恢复标记 (会务方快照迁移): 每次成功恢复写入一行。
+-- 恢复只接受"尚无业务记录"的目标实例; 本表使"恢复过空快照的实例"也能被识别,
+-- 重复恢复一律拒绝 (409), 与业务表非空检查共同保证恢复不叠加、不留部分数据。
+-- 本表是实例本地元数据, 不属于业务数据, 不随快照导出。
+CREATE TABLE IF NOT EXISTS migration_restores (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    checksum       TEXT NOT NULL,      -- 已恢复快照的内容校验和 (sha256:...)
+    format_version INTEGER NOT NULL,   -- 已恢复快照的格式版本
+    revision       INTEGER NOT NULL,   -- 恢复后实例的资料修订号
+    serial         INTEGER NOT NULL,   -- 恢复后实例的发布序号 (无发布版为 0)
+    restored_at    TEXT NOT NULL       -- 恢复完成时刻 (UTC)
 );
 """
 

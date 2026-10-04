@@ -12,12 +12,12 @@ import secrets
 import sqlite3
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import db
+from . import db, migration
 from .schemas import (
     AssignmentDecisionIn,
     BackfillPublishIn,
@@ -3073,6 +3073,76 @@ def submit_review_correction(
         "original_receipt": corr["original_receipt"],
         "corrected_at": now,
         "changed": True,
+    }
+
+
+# ---------------------------------------------------------------- 实例迁移 (会务方)
+
+@app.get("/migration/export")
+def export_migration_snapshot(_: bool = Depends(require_organizer)):
+    """导出一致的业务数据快照 (会务方实例迁移)。
+
+    在 BEGIN IMMEDIATE 写事务内读取全部业务表, 与并发写入隔离:
+    快照覆盖论文 (含已撤回) 与评审人资料 (含评审人凭据)、资格变更、硬回避、
+    资料修订号与当前发布版 (发布序号/方案/解释)、锁定表、机构归并、保障等级、
+    统一评审截止、撤回记录、评审人决定、正式评语、更正记录、匿名反馈快照
+    (含访问码) 与作者异议 (含查询凭据); 不包含会务方密钥。
+    响应附格式版本与内容校验和 (对 data 的规范化 JSON 取 SHA-256),
+    恢复方据此核对格式与内容完整性。导出为只读操作, 不推进任何版本号。
+    """
+    with db.write_txn() as conn:  # BEGIN IMMEDIATE: 与并发写入串行化, 得到一致快照
+        data = migration.collect_snapshot(conn)
+    return {
+        "format": migration.FORMAT,
+        "format_version": migration.FORMAT_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "checksum": migration.snapshot_checksum(data),
+        "data": data,
+    }
+
+
+@app.post("/migration/restore")
+def restore_migration_snapshot(body: dict = Body(...), _: bool = Depends(require_organizer)):
+    """把导出的业务数据快照恢复到空实例 (会务方实例迁移)。
+
+    - 先核对格式标识/格式版本与内容校验和, 再校验记录结构与引用符合
+      历史保留规则; 任一不符 422 拒绝且不写入任何数据;
+    - 仅接受尚无业务记录 (业务表全空且资料修订号为 0) 且从未恢复过的实例;
+      目标非空或重复恢复 409 拒绝且不留下部分数据;
+    - 全部写入在同一个 BEGIN IMMEDIATE 写事务内完成, 任一失败整体回滚;
+    - 恢复成功后资料修订号、发布序号、历史记录、评审人凭据、反馈访问码与
+      异议查询凭据按原规则继续工作; 恢复本身不推进修订号与发布序号。
+    """
+    try:
+        migration.validate_envelope(body)
+        data = body["data"]
+        migration.validate_snapshot(data)
+    except migration.SnapshotValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        try:
+            migration.assert_restorable_target(conn)
+        except migration.RestoreConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        try:
+            counts = migration.load_snapshot(conn, data)
+        except sqlite3.IntegrityError as exc:
+            # 校验兜底: 存储层约束 (主键/唯一/检查) 拒绝时整体回滚, 不留部分数据
+            raise HTTPException(
+                status_code=422, detail=f"快照内容违反存储约束, 恢复拒绝: {exc}"
+            )
+        migration.record_restore(conn, body["checksum"], data, now)
+    published = data["published"]
+    return {
+        "ok": True,
+        "restored": True,
+        "format_version": migration.FORMAT_VERSION,
+        "checksum": body["checksum"],
+        "revision": data["revision"],
+        "serial": published["serial"] if published is not None else None,
+        "restored_at": now,
+        "counts": counts,
     }
 
 
