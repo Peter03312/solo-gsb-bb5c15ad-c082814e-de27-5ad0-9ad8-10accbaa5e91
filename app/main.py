@@ -6,13 +6,14 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
 import sqlite3
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -3211,6 +3212,1035 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
         "released_overdue_confirmations": released_overdue_confirmations,
         "overdue_slots": result["overdue_slots"],
         "plan": new_plan,
+    }
+
+
+# ---------------------------------------------------------------- 实例迁移 (会务方)
+
+# 会务方迁移实例: 通过 HTTP API 导出一致的业务数据快照, 并在空实例恢复。
+# - 快照涵盖全部现存业务记录: 论文与评审人资料 (含评审人凭据)、资格变更记录、
+#   硬回避、资料修订号与当前发布版 (含发布序号)、普通分配锁定表、机构归并边、
+#   评审保障等级、统一评审截止、论文撤回记录、槽位决定、正式评语、评语更正、
+#   匿名反馈快照 (含访问码) 与作者异议 (含查询凭据); 会务方密钥来自环境变量,
+#   不属于业务数据, 快照绝不包含;
+# - 导出在同一个 BEGIN IMMEDIATE 写事务内读取全部业务表, 与并发写入隔离;
+#   快照附格式标识、格式版本与对 data 规范化 JSON 计算的 sha256 内容校验和;
+# - 恢复前依次核对: 顶层格式与格式版本、内容校验和、逐表结构与取值、唯一性,
+#   以及符合历史保留规则的记录引用; 只接受尚无业务记录的空实例;
+# - 校验失败 (422)、目标非空或重复恢复 (409) 一律拒绝且不留下部分数据:
+#   全部校验在写入前完成, 写入在同一个写事务内原子提交;
+# - 恢复逐字写回全部业务记录 (含各自增主键行 id), 不推进修订号与发布序号;
+#   恢复后修订号、发布序号、历史记录与既有凭据/访问码按原规则工作。
+
+MIGRATION_FORMAT = "review-assignment-migration"
+MIGRATION_FORMAT_VERSION = 1
+
+# meta 表中的恢复标记: 同一实例不得重复恢复 (即使恢复的是空快照)
+_MIGRATION_RESTORED_META_KEY = "migration_restored"
+
+# 迁移快照 data 中以数组形式覆盖的业务记录表 (published 为单例对象, 单独处理)
+_MIGRATION_TABLES = (
+    "papers",
+    "reviewers",
+    "assignment_decisions",
+    "submitted_reviews",
+    "reviewer_recusals",
+    "reviewer_status_changes",
+    "feedback_snapshots",
+    "institution_merges",
+    "assignment_locks",
+    "review_corrections",
+    "feedback_objections",
+    "paper_withdrawals",
+    "paper_guarantee_levels",
+    "review_deadlines",
+)
+
+# 各表行结构: {字段名: (Python 类型, 是否允许 null)}。JSON 存储列导出为解析后的
+# JSON 值 (恢复时重新序列化, 语义等价); 布尔标记导出为 true/false。
+_MIGRATION_SPECS = {
+    "papers": {
+        "paper_id": (str, False), "manuscript": (str, False),
+        "topics": (list, False), "institutions": (list, False),
+        "withdrawn": (bool, False),
+    },
+    "reviewers": {
+        "reviewer_id": (str, False), "credential": (str, False),
+        "topics": (list, False), "institution": (str, False),
+        "capacity": (int, False), "avoid_papers": (list, False),
+        "active": (bool, False),
+    },
+    "assignment_decisions": {
+        "serial": (int, False), "paper_id": (str, False), "reviewer_id": (str, False),
+        "state": (str, False), "reason": (str, True), "decided_at": (str, False),
+    },
+    "submitted_reviews": {
+        "serial": (int, False), "paper_id": (str, False), "reviewer_id": (str, False),
+        "score": (int, False), "comment": (str, False), "receipt": (str, False),
+        "submitted_at": (str, False),
+    },
+    "reviewer_recusals": {
+        "reviewer_id": (str, False), "paper_id": (str, False), "reason": (str, False),
+        "created_serial": (int, False), "created_revision": (int, False),
+        "created_at": (str, False),
+    },
+    "reviewer_status_changes": {
+        "id": (int, False), "reviewer_id": (str, False), "active": (bool, False),
+        "reason": (str, False), "revision": (int, False), "changed_at": (str, False),
+    },
+    "feedback_snapshots": {
+        "id": (int, False), "paper_id": (str, False), "version": (int, False),
+        "serial": (int, False), "receipt1": (str, False), "receipt2": (str, False),
+        "access_code": (str, False), "review1": (dict, False), "review2": (dict, False),
+        "created_at": (str, False), "invalidated": (bool, False),
+    },
+    "institution_merges": {
+        "id": (int, False), "name_a": (str, False), "name_b": (str, False),
+        "revision": (int, False), "merged_at": (str, False),
+    },
+    "assignment_locks": {
+        "paper_id": (str, False), "reviewers": (list, False), "updated_at": (str, False),
+    },
+    "review_corrections": {
+        "id": (int, False), "serial": (int, False), "paper_id": (str, False),
+        "reviewer_id": (str, False), "reason": (str, False),
+        "original_score": (int, False), "original_comment": (str, False),
+        "original_receipt": (str, False), "original_submitted_at": (str, False),
+        "state": (str, False), "new_score": (int, True), "new_comment": (str, True),
+        "new_receipt": (str, True), "requested_at": (str, False),
+        "corrected_at": (str, True),
+    },
+    "feedback_objections": {
+        "id": (int, False), "snapshot_id": (int, False), "paper_id": (str, False),
+        "serial": (int, False), "label": (int, False), "reason": (str, False),
+        "frozen_review": (dict, False), "target_receipt": (str, False),
+        "state": (str, False), "query_token": (str, False),
+        "resolution_note": (str, True), "correction_id": (int, True),
+        "created_at": (str, False), "decided_at": (str, True),
+    },
+    "paper_withdrawals": {
+        "paper_id": (str, False), "reason": (str, False), "revision": (int, False),
+        "published_serial": (int, True), "published_plan": (list, True),
+        "withdrawn_at": (str, False),
+    },
+    "paper_guarantee_levels": {
+        "paper_id": (str, False), "level": (str, False),
+        "revision": (int, False), "updated_at": (str, False),
+    },
+    "review_deadlines": {
+        "serial": (int, False), "revision": (int, False),
+        "deadline_at": (str, False), "set_at": (str, False),
+    },
+}
+
+
+def _migration_checksum(data) -> str:
+    """对 data 的规范化 JSON (键排序、紧凑分隔符、UTF-8) 计算 sha256 内容校验和。"""
+    canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _migration_export_data(conn):
+    """在调用方事务内读取全部业务表, 生成迁移快照的 data 部分 (不含会务方密钥)。
+
+    各自增主键表的行 id 一并导出, 使 异议->快照、异议->更正 等历史引用
+    在恢复后保持原值; 各表按主键排序输出, 同一业务状态下快照内容确定。
+    """
+    data = {"meta": {"revision": db.get_revision(conn)}}
+    data["papers"] = [
+        {
+            "paper_id": r["paper_id"],
+            "manuscript": r["manuscript"],
+            "topics": json.loads(r["topics"]),
+            "institutions": json.loads(r["institutions"]),
+            "withdrawn": bool(r["withdrawn"]),
+        }
+        for r in conn.execute("SELECT * FROM papers ORDER BY paper_id").fetchall()
+    ]
+    data["reviewers"] = [
+        {
+            "reviewer_id": r["reviewer_id"],
+            "credential": r["credential"],
+            "topics": json.loads(r["topics"]),
+            "institution": r["institution"],
+            "capacity": r["capacity"],
+            "avoid_papers": json.loads(r["avoid_papers"]),
+            "active": bool(r["active"]),
+        }
+        for r in conn.execute("SELECT * FROM reviewers ORDER BY reviewer_id").fetchall()
+    ]
+    published = _load_published(conn)
+    data["published"] = (
+        None
+        if published is None
+        else {
+            "serial": published["serial"],
+            "revision": published["revision"],
+            "plan": json.loads(published["plan"]),
+            "explanations": json.loads(published["explanations"]),
+            "published_at": published["published_at"],
+        }
+    )
+    data["assignment_decisions"] = [
+        {
+            "serial": r["serial"], "paper_id": r["paper_id"],
+            "reviewer_id": r["reviewer_id"], "state": r["state"],
+            "reason": r["reason"], "decided_at": r["decided_at"],
+        }
+        for r in conn.execute(
+            "SELECT * FROM assignment_decisions ORDER BY serial, paper_id, reviewer_id"
+        ).fetchall()
+    ]
+    data["submitted_reviews"] = [
+        {
+            "serial": r["serial"], "paper_id": r["paper_id"],
+            "reviewer_id": r["reviewer_id"], "score": r["score"],
+            "comment": r["comment"], "receipt": r["receipt"],
+            "submitted_at": r["submitted_at"],
+        }
+        for r in conn.execute(
+            "SELECT * FROM submitted_reviews ORDER BY serial, paper_id, reviewer_id"
+        ).fetchall()
+    ]
+    data["reviewer_recusals"] = [
+        {
+            "reviewer_id": r["reviewer_id"], "paper_id": r["paper_id"],
+            "reason": r["reason"], "created_serial": r["created_serial"],
+            "created_revision": r["created_revision"], "created_at": r["created_at"],
+        }
+        for r in conn.execute(
+            "SELECT * FROM reviewer_recusals ORDER BY reviewer_id, paper_id"
+        ).fetchall()
+    ]
+    data["reviewer_status_changes"] = [
+        {
+            "id": r["id"], "reviewer_id": r["reviewer_id"], "active": bool(r["active"]),
+            "reason": r["reason"], "revision": r["revision"], "changed_at": r["changed_at"],
+        }
+        for r in conn.execute("SELECT * FROM reviewer_status_changes ORDER BY id").fetchall()
+    ]
+    data["feedback_snapshots"] = [
+        {
+            "id": r["id"], "paper_id": r["paper_id"], "version": r["version"],
+            "serial": r["serial"], "receipt1": r["receipt1"], "receipt2": r["receipt2"],
+            "access_code": r["access_code"],
+            "review1": json.loads(r["review1"]), "review2": json.loads(r["review2"]),
+            "created_at": r["created_at"], "invalidated": bool(r["invalidated"]),
+        }
+        for r in conn.execute("SELECT * FROM feedback_snapshots ORDER BY id").fetchall()
+    ]
+    data["institution_merges"] = [
+        {
+            "id": r["id"], "name_a": r["name_a"], "name_b": r["name_b"],
+            "revision": r["revision"], "merged_at": r["merged_at"],
+        }
+        for r in conn.execute("SELECT * FROM institution_merges ORDER BY id").fetchall()
+    ]
+    data["assignment_locks"] = [
+        {
+            "paper_id": r["paper_id"],
+            "reviewers": json.loads(r["reviewers_json"]),
+            "updated_at": r["updated_at"],
+        }
+        for r in conn.execute("SELECT * FROM assignment_locks ORDER BY paper_id").fetchall()
+    ]
+    data["review_corrections"] = [
+        {
+            "id": r["id"], "serial": r["serial"], "paper_id": r["paper_id"],
+            "reviewer_id": r["reviewer_id"], "reason": r["reason"],
+            "original_score": r["original_score"], "original_comment": r["original_comment"],
+            "original_receipt": r["original_receipt"],
+            "original_submitted_at": r["original_submitted_at"],
+            "state": r["state"], "new_score": r["new_score"],
+            "new_comment": r["new_comment"], "new_receipt": r["new_receipt"],
+            "requested_at": r["requested_at"], "corrected_at": r["corrected_at"],
+        }
+        for r in conn.execute("SELECT * FROM review_corrections ORDER BY id").fetchall()
+    ]
+    data["feedback_objections"] = [
+        {
+            "id": r["id"], "snapshot_id": r["snapshot_id"], "paper_id": r["paper_id"],
+            "serial": r["serial"], "label": r["label"], "reason": r["reason"],
+            "frozen_review": json.loads(r["frozen_review_json"]),
+            "target_receipt": r["target_receipt"], "state": r["state"],
+            "query_token": r["query_token"], "resolution_note": r["resolution_note"],
+            "correction_id": r["correction_id"], "created_at": r["created_at"],
+            "decided_at": r["decided_at"],
+        }
+        for r in conn.execute("SELECT * FROM feedback_objections ORDER BY id").fetchall()
+    ]
+    data["paper_withdrawals"] = [
+        {
+            "paper_id": r["paper_id"], "reason": r["reason"], "revision": r["revision"],
+            "published_serial": r["published_serial"],
+            "published_plan": (
+                json.loads(r["published_plan_json"])
+                if r["published_plan_json"] is not None
+                else None
+            ),
+            "withdrawn_at": r["withdrawn_at"],
+        }
+        for r in conn.execute("SELECT * FROM paper_withdrawals ORDER BY paper_id").fetchall()
+    ]
+    data["paper_guarantee_levels"] = [
+        {
+            "paper_id": r["paper_id"], "level": r["level"],
+            "revision": r["revision"], "updated_at": r["updated_at"],
+        }
+        for r in conn.execute(
+            "SELECT * FROM paper_guarantee_levels ORDER BY paper_id"
+        ).fetchall()
+    ]
+    data["review_deadlines"] = [
+        {
+            "serial": r["serial"], "revision": r["revision"],
+            "deadline_at": r["deadline_at"], "set_at": r["set_at"],
+        }
+        for r in conn.execute("SELECT * FROM review_deadlines ORDER BY serial").fetchall()
+    ]
+    return data
+
+
+def _migration_type_ok(value, kind) -> bool:
+    # bool 是 int 的子类: 整数字段必须拒绝布尔值, 布尔字段只接受布尔值
+    if kind is int:
+        return type(value) is int
+    if kind is bool:
+        return type(value) is bool
+    return isinstance(value, kind)
+
+
+def _migration_check_row(table, index, row, spec, problems):
+    if not isinstance(row, dict):
+        problems.append(f"{table}[{index}] 必须是对象")
+        return
+    missing = sorted(set(spec) - set(row))
+    extra = sorted(set(row) - set(spec))
+    if missing or extra:
+        problems.append(f"{table}[{index}] 字段不符: 缺少 {missing}, 多余 {extra}")
+        return
+    for field, (kind, nullable) in spec.items():
+        value = row[field]
+        if value is None and nullable:
+            continue
+        if not _migration_type_ok(value, kind):
+            problems.append(
+                f"{table}[{index}].{field} 类型不符 (应为 {kind.__name__}"
+                f"{', 可为 null' if nullable else ''})"
+            )
+
+
+def _migration_check_unique(rows, keyfn, table, desc, problems):
+    seen = set()
+    for row in rows:
+        k = keyfn(row)
+        if k in seen:
+            problems.append(f"{table} 存在重复的{desc}: {k!r}")
+        seen.add(k)
+
+
+def _migration_check_frozen_review(value, where, problems):
+    """冻结评语内容 {score, comment}: 快照与异议冻结内容共用同一结构。"""
+    if set(value) != {"score", "comment"}:
+        problems.append(f"{where} 必须是仅含 score/comment 的对象")
+        return
+    if type(value["score"]) is not int or not 1 <= value["score"] <= 5:
+        problems.append(f"{where}.score 必须是 1~5 的整数")
+    if not isinstance(value["comment"], str) or not value["comment"]:
+        problems.append(f"{where}.comment 必须是非空字符串")
+
+
+def _migration_is_iso_moment(text) -> bool:
+    try:
+        dt = datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return False
+    return dt.tzinfo is not None
+
+
+def _migration_validate_values(data, problems):
+    """逐表取值与唯一性校验 (枚举、取值范围、非空、主键/唯一约束); 结构已先行通过。"""
+    for i, p in enumerate(data["papers"]):
+        if not p["paper_id"]:
+            problems.append(f"papers[{i}].paper_id 必须非空")
+        for field in ("topics", "institutions"):
+            if not all(isinstance(x, str) for x in p[field]):
+                problems.append(f"papers[{i}].{field} 必须是字符串数组")
+    _migration_check_unique(data["papers"], lambda r: r["paper_id"], "papers", "论文编号", problems)
+
+    for i, r in enumerate(data["reviewers"]):
+        if not r["reviewer_id"] or not r["credential"]:
+            problems.append(f"reviewers[{i}] 的评审人编号与凭据必须非空")
+        if r["capacity"] < 1:
+            problems.append(f"reviewers[{i}].capacity 必须是 >=1 的整数")
+        if not r["institution"]:
+            problems.append(f"reviewers[{i}].institution 必须非空")
+        for field in ("topics", "avoid_papers"):
+            if not all(isinstance(x, str) for x in r[field]):
+                problems.append(f"reviewers[{i}].{field} 必须是字符串数组")
+    _migration_check_unique(
+        data["reviewers"], lambda r: r["reviewer_id"], "reviewers", "评审人编号", problems
+    )
+
+    for i, d in enumerate(data["assignment_decisions"]):
+        if d["serial"] < 1:
+            problems.append(f"assignment_decisions[{i}].serial 必须是 >=1 的整数")
+        if d["state"] not in ("confirmed", "recused"):
+            problems.append(f"assignment_decisions[{i}].state 非法: {d['state']!r}")
+        elif d["state"] == "recused" and not (isinstance(d["reason"], str) and d["reason"]):
+            problems.append(f"assignment_decisions[{i}] 回避决定必须携带非空原因")
+        elif d["state"] == "confirmed" and d["reason"] is not None:
+            problems.append(f"assignment_decisions[{i}] 确认决定不得携带回避原因")
+    _migration_check_unique(
+        data["assignment_decisions"],
+        lambda r: (r["serial"], r["paper_id"], r["reviewer_id"]),
+        "assignment_decisions", "槽位决定", problems,
+    )
+
+    for i, r in enumerate(data["submitted_reviews"]):
+        if r["serial"] < 1:
+            problems.append(f"submitted_reviews[{i}].serial 必须是 >=1 的整数")
+        if not 1 <= r["score"] <= 5:
+            problems.append(f"submitted_reviews[{i}].score 必须是 1~5 的整数")
+        if not r["comment"] or not r["receipt"]:
+            problems.append(f"submitted_reviews[{i}] 的评语与收据必须非空")
+    _migration_check_unique(
+        data["submitted_reviews"],
+        lambda r: (r["serial"], r["paper_id"], r["reviewer_id"]),
+        "submitted_reviews", "槽位评语", problems,
+    )
+
+    for i, r in enumerate(data["reviewer_recusals"]):
+        if not r["reason"]:
+            problems.append(f"reviewer_recusals[{i}].reason 必须非空")
+        if r["created_serial"] < 1 or r["created_revision"] < 1:
+            problems.append(f"reviewer_recusals[{i}] 的创建序号/修订号必须是 >=1 的整数")
+    _migration_check_unique(
+        data["reviewer_recusals"],
+        lambda r: (r["reviewer_id"], r["paper_id"]),
+        "reviewer_recusals", "硬回避", problems,
+    )
+
+    for i, r in enumerate(data["reviewer_status_changes"]):
+        if not r["reason"]:
+            problems.append(f"reviewer_status_changes[{i}].reason 必须非空")
+        if r["revision"] < 1:
+            problems.append(f"reviewer_status_changes[{i}].revision 必须是 >=1 的整数")
+    _migration_check_unique(
+        data["reviewer_status_changes"], lambda r: r["id"], "reviewer_status_changes", "行 id", problems
+    )
+
+    for i, s in enumerate(data["feedback_snapshots"]):
+        if s["version"] < 1 or s["serial"] < 1:
+            problems.append(f"feedback_snapshots[{i}] 的 version/serial 必须是 >=1 的整数")
+        if not s["receipt1"] or not s["receipt2"] or not s["access_code"]:
+            problems.append(f"feedback_snapshots[{i}] 的评语收据与访问码必须非空")
+        _migration_check_frozen_review(s["review1"], f"feedback_snapshots[{i}].review1", problems)
+        _migration_check_frozen_review(s["review2"], f"feedback_snapshots[{i}].review2", problems)
+    _migration_check_unique(
+        data["feedback_snapshots"], lambda r: r["id"], "feedback_snapshots", "行 id", problems
+    )
+    _migration_check_unique(
+        data["feedback_snapshots"], lambda r: r["access_code"],
+        "feedback_snapshots", "访问码", problems,
+    )
+    _migration_check_unique(
+        data["feedback_snapshots"], lambda r: (r["paper_id"], r["version"]),
+        "feedback_snapshots", "论文版本号", problems,
+    )
+    _migration_check_unique(
+        data["feedback_snapshots"],
+        lambda r: (r["paper_id"], r["serial"], r["receipt1"], r["receipt2"]),
+        "feedback_snapshots", "幂等键", problems,
+    )
+
+    for i, m in enumerate(data["institution_merges"]):
+        if not m["name_a"] or not m["name_b"]:
+            problems.append(f"institution_merges[{i}] 的机构原名必须非空")
+        if m["revision"] < 1:
+            problems.append(f"institution_merges[{i}].revision 必须是 >=1 的整数")
+    _migration_check_unique(
+        data["institution_merges"], lambda r: r["id"], "institution_merges", "行 id", problems
+    )
+
+    for i, lk in enumerate(data["assignment_locks"]):
+        ids = lk["reviewers"]
+        if not lk["paper_id"]:
+            problems.append(f"assignment_locks[{i}].paper_id 必须非空")
+        if not 1 <= len(ids) <= 2 or not all(isinstance(x, str) and x for x in ids):
+            problems.append(f"assignment_locks[{i}].reviewers 必须是 1~2 个非空评审人编号")
+        elif len(set(ids)) != len(ids):
+            problems.append(f"assignment_locks[{i}].reviewers 存在重复评审人")
+    _migration_check_unique(
+        data["assignment_locks"], lambda r: r["paper_id"], "assignment_locks", "论文编号", problems
+    )
+
+    for i, c in enumerate(data["review_corrections"]):
+        if c["serial"] < 1:
+            problems.append(f"review_corrections[{i}].serial 必须是 >=1 的整数")
+        if not c["reason"] or not c["original_comment"] or not c["original_receipt"]:
+            problems.append(f"review_corrections[{i}] 的更正原因与原评语内容/收据必须非空")
+        if not 1 <= c["original_score"] <= 5:
+            problems.append(f"review_corrections[{i}].original_score 必须是 1~5 的整数")
+        if c["state"] not in ("pending", "completed"):
+            problems.append(f"review_corrections[{i}].state 非法: {c['state']!r}")
+        elif c["state"] == "pending":
+            if any(
+                c[k] is not None
+                for k in ("new_score", "new_comment", "new_receipt", "corrected_at")
+            ):
+                problems.append(f"review_corrections[{i}] 待更正记录不得携带更正后内容")
+        else:
+            if any(
+                c[k] is None
+                for k in ("new_score", "new_comment", "new_receipt", "corrected_at")
+            ):
+                problems.append(f"review_corrections[{i}] 已完成更正缺少更正后内容")
+            elif not 1 <= c["new_score"] <= 5:
+                problems.append(f"review_corrections[{i}].new_score 必须是 1~5 的整数")
+    _migration_check_unique(
+        data["review_corrections"], lambda r: r["id"], "review_corrections", "行 id", problems
+    )
+
+    for i, o in enumerate(data["feedback_objections"]):
+        if o["serial"] < 1:
+            problems.append(f"feedback_objections[{i}].serial 必须是 >=1 的整数")
+        if o["label"] not in (1, 2):
+            problems.append(f"feedback_objections[{i}].label 必须是 1 或 2")
+        if not o["reason"] or not o["target_receipt"] or not o["query_token"]:
+            problems.append(f"feedback_objections[{i}] 的理由/目标收据/查询凭据必须非空")
+        _migration_check_frozen_review(
+            o["frozen_review"], f"feedback_objections[{i}].frozen_review", problems
+        )
+        if o["state"] not in ("pending", "rejected", "accepted", "expired"):
+            problems.append(f"feedback_objections[{i}].state 非法: {o['state']!r}")
+        elif o["state"] == "pending":
+            if o["decided_at"] is not None or o["correction_id"] is not None:
+                problems.append(f"feedback_objections[{i}] 待处理异议不得携带处理时间/关联更正")
+        elif o["state"] == "accepted":
+            if o["decided_at"] is None or o["correction_id"] is None or not o["resolution_note"]:
+                problems.append(
+                    f"feedback_objections[{i}] 已受理异议必须携带处理时间、关联更正与受理原因"
+                )
+        else:  # rejected / expired 为终态, 必须有处理时间, 无关联更正
+            if o["decided_at"] is None:
+                problems.append(f"feedback_objections[{i}] 已处理/已过期异议缺少处理时间")
+            if o["correction_id"] is not None:
+                problems.append(f"feedback_objections[{i}] 驳回/过期异议不得关联更正请求")
+    _migration_check_unique(
+        data["feedback_objections"], lambda r: r["id"], "feedback_objections", "行 id", problems
+    )
+    _migration_check_unique(
+        data["feedback_objections"], lambda r: r["query_token"],
+        "feedback_objections", "查询凭据", problems,
+    )
+    _migration_check_unique(
+        data["feedback_objections"], lambda r: (r["snapshot_id"], r["label"]),
+        "feedback_objections", "快照标号", problems,
+    )
+
+    for i, w in enumerate(data["paper_withdrawals"]):
+        if not w["reason"]:
+            problems.append(f"paper_withdrawals[{i}].reason 必须非空")
+        if w["revision"] < 1:
+            problems.append(f"paper_withdrawals[{i}].revision 必须是 >=1 的整数")
+        if (w["published_serial"] is None) != (w["published_plan"] is None):
+            problems.append(
+                f"paper_withdrawals[{i}] 冻结的发布序号与槽位必须同时存在或同时为空"
+            )
+        if w["published_serial"] is not None and w["published_serial"] < 1:
+            problems.append(f"paper_withdrawals[{i}].published_serial 必须是 >=1 的整数")
+        if w["published_plan"] is not None and not all(
+            isinstance(x, str) for x in w["published_plan"]
+        ):
+            problems.append(f"paper_withdrawals[{i}].published_plan 必须是字符串数组")
+    _migration_check_unique(
+        data["paper_withdrawals"], lambda r: r["paper_id"], "paper_withdrawals", "论文编号", problems
+    )
+
+    for i, lv in enumerate(data["paper_guarantee_levels"]):
+        if lv["level"] not in ("high", "medium"):
+            problems.append(
+                f"paper_guarantee_levels[{i}].level 非法: {lv['level']!r} (未设置即普通, 不落行)"
+            )
+        if lv["revision"] < 1:
+            problems.append(f"paper_guarantee_levels[{i}].revision 必须是 >=1 的整数")
+    _migration_check_unique(
+        data["paper_guarantee_levels"], lambda r: r["paper_id"],
+        "paper_guarantee_levels", "论文编号", problems,
+    )
+
+    for i, dl in enumerate(data["review_deadlines"]):
+        if dl["serial"] < 1:
+            problems.append(f"review_deadlines[{i}].serial 必须是 >=1 的整数")
+        if dl["revision"] < 0:
+            problems.append(f"review_deadlines[{i}].revision 必须是非负整数")
+        for field in ("deadline_at", "set_at"):
+            if not _migration_is_iso_moment(dl[field]):
+                problems.append(f"review_deadlines[{i}].{field} 必须是带时区的 ISO 8601 时刻")
+    _migration_check_unique(
+        data["review_deadlines"], lambda r: r["serial"], "review_deadlines", "发布序号", problems
+    )
+
+
+def _migration_validate_structure(doc, data):
+    """结构校验: data 字段集合、meta/published 形状、逐表行结构与逐表取值。"""
+    expected = {"meta", "published", *_MIGRATION_TABLES}
+    if not isinstance(data, dict) or set(data) != expected:
+        keys = set(data) if isinstance(data, dict) else set()
+        return [f"data 字段不符: 缺少 {sorted(expected - keys)}, 多余 {sorted(keys - expected)}"]
+    problems = []
+    meta = data["meta"]
+    if (
+        not isinstance(meta, dict)
+        or set(meta) != {"revision"}
+        or type(meta["revision"]) is not int
+        or meta["revision"] < 0
+    ):
+        return ["meta 必须是 {\"revision\": 非负整数}"]
+    if doc["revision"] != meta["revision"]:
+        problems.append("顶层 revision 与 data.meta.revision 不一致")
+    published = data["published"]
+    if published is not None:
+        if not isinstance(published, dict) or set(published) != {
+            "serial", "revision", "plan", "explanations", "published_at",
+        }:
+            return ["published 必须是仅含 serial/revision/plan/explanations/published_at 的对象或 null"]
+        if type(published["serial"]) is not int or published["serial"] < 1:
+            problems.append("published.serial 必须是 >=1 的整数")
+        if type(published["revision"]) is not int or published["revision"] < 0:
+            problems.append("published.revision 必须是非负整数")
+        if not isinstance(published["plan"], dict) or not isinstance(
+            published["explanations"], dict
+        ):
+            problems.append("published.plan 与 published.explanations 必须是对象")
+        elif not all(
+            isinstance(pid, str)
+            and isinstance(pair, list)
+            and len(pair) == 2
+            and all(isinstance(rid, str) for rid in pair)
+            for pid, pair in published["plan"].items()
+        ):
+            problems.append("published.plan 的每个槽位必须是两名评审人编号")
+        if not isinstance(published["published_at"], str):
+            problems.append("published.published_at 必须是字符串")
+    if problems:
+        return problems
+    if doc["serial"] != (published["serial"] if published is not None else None):
+        problems.append("顶层 serial 与 data.published.serial 不一致")
+    for table in _MIGRATION_TABLES:
+        rows = data[table]
+        if not isinstance(rows, list):
+            problems.append(f"data.{table} 必须是数组")
+            continue
+        spec = _MIGRATION_SPECS[table]
+        for i, row in enumerate(rows):
+            _migration_check_row(table, i, row, spec, problems)
+        if len(problems) > 100:
+            problems.append("结构问题过多, 仅列出前 100 条")
+            return problems
+    if problems:
+        return problems
+    _migration_validate_values(data, problems)
+    return problems
+
+
+def _migration_validate_references(data):
+    """记录引用校验: 仅核对历史保留规则所保证的引用与版本关系。
+
+    论文/评审人资料可被删除, 故历史记录 (决定/评语/回避/资格变更) 不要求其
+    指向现存资料; 但按保留规则绝不删除的记录之间的引用必须成立:
+    异议 -> 快照/更正、更正 -> 评语、撤回记录 <-> 论文撤回标记、
+    锁定/保障等级 -> 现存未撤回论文, 以及各记录的修订号/发布序号不超前于
+    快照的当前修订号/发布序号。
+    """
+    problems = []
+    revision = data["meta"]["revision"]
+    published = data["published"]
+    serial = published["serial"] if published is not None else None
+    papers = {p["paper_id"]: p for p in data["papers"]}
+    snapshots = {s["id"]: s for s in data["feedback_snapshots"]}
+    corrections = {c["id"]: c for c in data["review_corrections"]}
+    reviews = {
+        (r["serial"], r["paper_id"], r["reviewer_id"]): r
+        for r in data["submitted_reviews"]
+    }
+
+    def check_serial_rows(table, rows):
+        if rows and published is None:
+            problems.append(f"{table} 存在记录但快照不含已发布版本 (记录须依附于某个发布版)")
+        for r in rows:
+            if serial is not None and r["serial"] > serial:
+                problems.append(
+                    f"{table} 存在超过当前发布序号的记录 (serial={r['serial']} > {serial})"
+                )
+
+    for table in (
+        "assignment_decisions", "submitted_reviews", "review_corrections",
+        "feedback_objections", "feedback_snapshots", "review_deadlines",
+    ):
+        check_serial_rows(table, data[table])
+
+    if data["reviewer_recusals"] and published is None:
+        problems.append("reviewer_recusals 存在记录但快照不含已发布版本 (回避须依附于某个发布版)")
+    for r in data["reviewer_recusals"]:
+        if serial is not None and r["created_serial"] > serial:
+            problems.append("reviewer_recusals 存在超过当前发布序号的记录")
+        if r["created_revision"] > revision:
+            problems.append("reviewer_recusals 存在超过当前资料修订号的记录")
+
+    for table in (
+        "reviewer_status_changes", "institution_merges",
+        "paper_withdrawals", "paper_guarantee_levels", "review_deadlines",
+    ):
+        for r in data[table]:
+            if r["revision"] > revision:
+                problems.append(
+                    f"{table} 记录的修订号 {r['revision']} 超过当前资料修订号 {revision}"
+                )
+    if published is not None and published["revision"] > revision:
+        problems.append("已发布版本所依据的修订号超过当前资料修订号")
+
+    withdrawal_ids = {w["paper_id"] for w in data["paper_withdrawals"]}
+    for pid, p in papers.items():
+        if p["withdrawn"] and pid not in withdrawal_ids:
+            problems.append(f"论文 {pid} 标记已撤回但缺少对应的撤回记录")
+    for w in data["paper_withdrawals"]:
+        p = papers.get(w["paper_id"])
+        if p is None:
+            problems.append(f"撤回记录引用了不存在的论文 {w['paper_id']}")
+        elif not p["withdrawn"]:
+            problems.append(f"撤回记录对应的论文 {w['paper_id']} 未标记撤回")
+        if w["published_serial"] is not None:
+            if published is None:
+                problems.append("撤回记录冻结了发布序号但快照不含已发布版本")
+            elif w["published_serial"] > serial:
+                problems.append("撤回记录冻结的发布序号超过当前发布序号")
+
+    for lv in data["paper_guarantee_levels"]:
+        p = papers.get(lv["paper_id"])
+        if p is None or p["withdrawn"]:
+            problems.append(f"保障等级引用了不存在或已撤回的论文 {lv['paper_id']}")
+    for lk in data["assignment_locks"]:
+        p = papers.get(lk["paper_id"])
+        if p is None or p["withdrawn"]:
+            problems.append(f"锁定表引用了不存在或已撤回的论文 {lk['paper_id']}")
+
+    for c in data["review_corrections"]:
+        review = reviews.get((c["serial"], c["paper_id"], c["reviewer_id"]))
+        if review is None:
+            problems.append(
+                f"更正记录 #{c['id']} 引用的评语"
+                f" (serial={c['serial']}, {c['paper_id']}, {c['reviewer_id']}) 不存在"
+            )
+        elif c["state"] == "completed" and review["receipt"] != c["new_receipt"]:
+            problems.append(f"更正记录 #{c['id']} 已完成但对应槽位评语的收据不符")
+
+    for o in data["feedback_objections"]:
+        snap = snapshots.get(o["snapshot_id"])
+        if snap is None:
+            problems.append(f"异议 #{o['id']} 引用的快照 #{o['snapshot_id']} 不存在")
+            continue
+        if o["paper_id"] != snap["paper_id"] or o["serial"] != snap["serial"]:
+            problems.append(f"异议 #{o['id']} 与所引快照的论文/发布序号不一致")
+        expected_receipt = snap["receipt1"] if o["label"] == 1 else snap["receipt2"]
+        if o["target_receipt"] != expected_receipt:
+            problems.append(f"异议 #{o['id']} 冻结的目标评语收据与所引快照不符")
+        expected_frozen = snap["review1"] if o["label"] == 1 else snap["review2"]
+        if o["frozen_review"] != expected_frozen:
+            problems.append(f"异议 #{o['id']} 冻结的反馈内容与所引快照不符")
+        if o["correction_id"] is not None:
+            corr = corrections.get(o["correction_id"])
+            if corr is None:
+                problems.append(f"异议 #{o['id']} 关联的更正记录 #{o['correction_id']} 不存在")
+            elif corr["paper_id"] != o["paper_id"] or corr["serial"] != o["serial"]:
+                problems.append(f"异议 #{o['id']} 关联的更正记录与异议的论文/序号不符")
+
+    if published is not None:
+        plan_pairs = {
+            (pid, rid) for pid, pair in published["plan"].items() for rid in pair
+        }
+        for d in data["assignment_decisions"]:
+            if d["serial"] == serial and (d["paper_id"], d["reviewer_id"]) not in plan_pairs:
+                problems.append(
+                    f"当前发布序号的决定 ({d['paper_id']}, {d['reviewer_id']}) 不在发布方案槽位中"
+                )
+        for r in data["submitted_reviews"]:
+            if r["serial"] == serial and (r["paper_id"], r["reviewer_id"]) not in plan_pairs:
+                problems.append(
+                    f"当前发布序号的评语 ({r['paper_id']}, {r['reviewer_id']}) 不在发布方案槽位中"
+                )
+    return problems
+
+
+def _migration_validate_document(doc):
+    """校验迁移快照文档, 返回问题清单 (字符串列表); 空列表表示校验通过。
+
+    依次核对: 顶层格式与格式版本 -> sha256 内容校验和 -> 逐表结构/取值/唯一性 ->
+    符合历史保留规则的记录引用。全部校验均为文档内部一致性核对, 不依赖目标实例。
+    """
+    if not isinstance(doc, dict):
+        return ["迁移快照必须是 JSON 对象"]
+    expected = {"format", "format_version", "exported_at", "revision", "serial", "checksum", "data"}
+    if set(doc) != expected:
+        return [
+            f"快照顶层字段不符: 缺少 {sorted(expected - set(doc))},"
+            f" 多余 {sorted(set(doc) - expected)}"
+        ]
+    problems = []
+    if doc["format"] != MIGRATION_FORMAT:
+        problems.append(f"无法识别的快照格式: {doc['format']!r} (应为 {MIGRATION_FORMAT!r})")
+    if type(doc["format_version"]) is not int or doc["format_version"] != MIGRATION_FORMAT_VERSION:
+        problems.append(
+            f"不支持的快照格式版本: {doc['format_version']!r}"
+            f" (本服务支持 {MIGRATION_FORMAT_VERSION})"
+        )
+    if not isinstance(doc["exported_at"], str):
+        problems.append("exported_at 必须是 ISO 8601 导出时刻字符串")
+    if not isinstance(doc["checksum"], str) or not doc["checksum"].startswith("sha256:"):
+        problems.append("缺少 sha256 内容校验和 (checksum)")
+    if not isinstance(doc["data"], dict):
+        problems.append("缺少 data 业务数据对象")
+    if problems:
+        return problems
+    data = doc["data"]
+    if _migration_checksum(data) != doc["checksum"]:
+        return ["内容校验和不匹配: 快照内容已损坏或被篡改, 拒绝恢复"]
+    problems = _migration_validate_structure(doc, data)
+    if problems:
+        return problems
+    return _migration_validate_references(data)
+
+
+def _instance_has_business_records(conn) -> bool:
+    """目标实例是否已存在业务记录 (或已完成过迁移恢复); 仅空实例可恢复。"""
+    if db.get_revision(conn) != 0:
+        return True
+    if conn.execute(
+        "SELECT 1 FROM meta WHERE key = ?", (_MIGRATION_RESTORED_META_KEY,)
+    ).fetchone():
+        return True
+    for table in ("published", *_MIGRATION_TABLES):
+        if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+            return True
+    return False
+
+
+def _migration_restore_data(conn, data):
+    """在同一个写事务内把快照逐字写入空实例 (调用方已完成校验并确认目标为空)。
+
+    不推进修订号与发布序号; 各自增主键表按原行 id 写回 (sqlite_sequence 随之
+    推进), 使 异议->快照、异议->更正 等历史引用在恢复后保持原值。
+    """
+    conn.execute(
+        "UPDATE meta SET value = ? WHERE key = 'revision'", (str(data["meta"]["revision"]),)
+    )
+    for r in data["papers"]:
+        conn.execute(
+            "INSERT INTO papers(paper_id, manuscript, topics, institutions, withdrawn)"
+            " VALUES (?,?,?,?,?)",
+            (
+                r["paper_id"], r["manuscript"],
+                json.dumps(r["topics"], ensure_ascii=False),
+                json.dumps(r["institutions"], ensure_ascii=False),
+                1 if r["withdrawn"] else 0,
+            ),
+        )
+    for r in data["reviewers"]:
+        conn.execute(
+            "INSERT INTO reviewers(reviewer_id, credential, topics, institution, capacity,"
+            " avoid_papers, active) VALUES (?,?,?,?,?,?,?)",
+            (
+                r["reviewer_id"], r["credential"],
+                json.dumps(r["topics"], ensure_ascii=False),
+                r["institution"], r["capacity"],
+                json.dumps(r["avoid_papers"], ensure_ascii=False),
+                1 if r["active"] else 0,
+            ),
+        )
+    published = data["published"]
+    if published is not None:
+        conn.execute(
+            "INSERT INTO published(id, serial, revision, plan, explanations, published_at)"
+            " VALUES (1,?,?,?,?,?)",
+            (
+                published["serial"], published["revision"],
+                json.dumps(published["plan"], ensure_ascii=False),
+                json.dumps(published["explanations"], ensure_ascii=False),
+                published["published_at"],
+            ),
+        )
+    for r in data["assignment_decisions"]:
+        conn.execute(
+            "INSERT INTO assignment_decisions(serial, paper_id, reviewer_id, state, reason,"
+            " decided_at) VALUES (?,?,?,?,?,?)",
+            (r["serial"], r["paper_id"], r["reviewer_id"], r["state"], r["reason"], r["decided_at"]),
+        )
+    for r in data["submitted_reviews"]:
+        conn.execute(
+            "INSERT INTO submitted_reviews(serial, paper_id, reviewer_id, score, comment,"
+            " receipt, submitted_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                r["serial"], r["paper_id"], r["reviewer_id"], r["score"],
+                r["comment"], r["receipt"], r["submitted_at"],
+            ),
+        )
+    for r in data["reviewer_recusals"]:
+        conn.execute(
+            "INSERT INTO reviewer_recusals(reviewer_id, paper_id, reason, created_serial,"
+            " created_revision, created_at) VALUES (?,?,?,?,?,?)",
+            (
+                r["reviewer_id"], r["paper_id"], r["reason"],
+                r["created_serial"], r["created_revision"], r["created_at"],
+            ),
+        )
+    for r in data["reviewer_status_changes"]:
+        conn.execute(
+            "INSERT INTO reviewer_status_changes(id, reviewer_id, active, reason, revision,"
+            " changed_at) VALUES (?,?,?,?,?,?)",
+            (r["id"], r["reviewer_id"], 1 if r["active"] else 0, r["reason"], r["revision"],
+             r["changed_at"]),
+        )
+    for r in data["feedback_snapshots"]:
+        conn.execute(
+            "INSERT INTO feedback_snapshots(id, paper_id, version, serial, receipt1, receipt2,"
+            " access_code, review1, review2, created_at, invalidated)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                r["id"], r["paper_id"], r["version"], r["serial"], r["receipt1"], r["receipt2"],
+                r["access_code"], json.dumps(r["review1"], ensure_ascii=False),
+                json.dumps(r["review2"], ensure_ascii=False), r["created_at"],
+                1 if r["invalidated"] else 0,
+            ),
+        )
+    for r in data["institution_merges"]:
+        conn.execute(
+            "INSERT INTO institution_merges(id, name_a, name_b, revision, merged_at)"
+            " VALUES (?,?,?,?,?)",
+            (r["id"], r["name_a"], r["name_b"], r["revision"], r["merged_at"]),
+        )
+    for r in data["assignment_locks"]:
+        conn.execute(
+            "INSERT INTO assignment_locks(paper_id, reviewers_json, updated_at) VALUES (?,?,?)",
+            (r["paper_id"], json.dumps(r["reviewers"], ensure_ascii=False), r["updated_at"]),
+        )
+    for r in data["review_corrections"]:
+        conn.execute(
+            "INSERT INTO review_corrections(id, serial, paper_id, reviewer_id, reason,"
+            " original_score, original_comment, original_receipt, original_submitted_at,"
+            " state, new_score, new_comment, new_receipt, requested_at, corrected_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                r["id"], r["serial"], r["paper_id"], r["reviewer_id"], r["reason"],
+                r["original_score"], r["original_comment"], r["original_receipt"],
+                r["original_submitted_at"], r["state"], r["new_score"], r["new_comment"],
+                r["new_receipt"], r["requested_at"], r["corrected_at"],
+            ),
+        )
+    for r in data["feedback_objections"]:
+        conn.execute(
+            "INSERT INTO feedback_objections(id, snapshot_id, paper_id, serial, label, reason,"
+            " frozen_review_json, target_receipt, state, query_token, resolution_note,"
+            " correction_id, created_at, decided_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                r["id"], r["snapshot_id"], r["paper_id"], r["serial"], r["label"], r["reason"],
+                json.dumps(r["frozen_review"], ensure_ascii=False), r["target_receipt"],
+                r["state"], r["query_token"], r["resolution_note"], r["correction_id"],
+                r["created_at"], r["decided_at"],
+            ),
+        )
+    for r in data["paper_withdrawals"]:
+        conn.execute(
+            "INSERT INTO paper_withdrawals(paper_id, reason, revision, published_serial,"
+            " published_plan_json, withdrawn_at) VALUES (?,?,?,?,?,?)",
+            (
+                r["paper_id"], r["reason"], r["revision"], r["published_serial"],
+                (
+                    json.dumps(r["published_plan"], ensure_ascii=False)
+                    if r["published_plan"] is not None
+                    else None
+                ),
+                r["withdrawn_at"],
+            ),
+        )
+    for r in data["paper_guarantee_levels"]:
+        conn.execute(
+            "INSERT INTO paper_guarantee_levels(paper_id, level, revision, updated_at)"
+            " VALUES (?,?,?,?)",
+            (r["paper_id"], r["level"], r["revision"], r["updated_at"]),
+        )
+    for r in data["review_deadlines"]:
+        conn.execute(
+            "INSERT INTO review_deadlines(serial, revision, deadline_at, set_at)"
+            " VALUES (?,?,?,?)",
+            (r["serial"], r["revision"], r["deadline_at"], r["set_at"]),
+        )
+    # 恢复标记: 同一实例不得重复恢复 (即使恢复的是空快照)
+    conn.execute("INSERT INTO meta(key, value) VALUES (?, '1')", (_MIGRATION_RESTORED_META_KEY,))
+
+
+@app.get("/migration/export")
+def export_migration_snapshot(_: bool = Depends(require_organizer)):
+    """会务方导出实例迁移快照 (一致的业务数据快照)。
+
+    在同一个 BEGIN IMMEDIATE 写事务内读取全部业务表, 与并发写入隔离;
+    快照涵盖全部现存业务记录 (含评审人凭据、反馈访问码与异议查询凭据),
+    附格式标识/格式版本与对 data 规范化 JSON 计算的 sha256 内容校验和;
+    会务方密钥来自环境变量, 不属于业务数据, 快照绝不包含。
+    """
+    with db.write_txn() as conn:
+        data = _migration_export_data(conn)
+    return {
+        "format": MIGRATION_FORMAT,
+        "format_version": MIGRATION_FORMAT_VERSION,
+        "exported_at": _utcnow().isoformat(),
+        "revision": data["meta"]["revision"],
+        "serial": data["published"]["serial"] if data["published"] is not None else None,
+        "checksum": _migration_checksum(data),
+        "data": data,
+    }
+
+
+@app.post("/migration/restore")
+def restore_migration_snapshot(body: dict = Body(...), _: bool = Depends(require_organizer)):
+    """会务方在空实例恢复迁移快照 (请求体即 GET /migration/export 返回的文档)。
+
+    - 恢复前依次核对: 顶层格式与格式版本、sha256 内容校验和、逐表结构/取值/
+      唯一性, 以及符合历史保留规则的记录引用; 任一不符 -> 422;
+    - 只接受尚无业务记录的目标实例 (修订号为 0、全部业务表为空且未曾恢复过);
+      目标非空或重复恢复 -> 409;
+    - 校验失败/目标非空/重复恢复均拒绝且不留下部分数据: 全部校验在写入前完成,
+      写入在同一个写事务内原子提交;
+    - 恢复逐字写回全部业务记录 (含修订号、发布序号与各类凭据/访问码),
+      不推进修订号与发布序号; 恢复后既有 API 契约与规则原样工作。
+    """
+    problems = _migration_validate_document(body)
+    if problems:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "迁移快照校验失败, 拒绝恢复 (未写入任何数据)",
+                "problems": problems,
+            },
+        )
+    data = body["data"]
+    with db.write_txn() as conn:
+        if _instance_has_business_records(conn):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "目标实例已存在业务记录 (或已完成过迁移恢复),"
+                    " 仅接受尚无业务记录的空实例; 拒绝恢复且未写入任何数据"
+                ),
+            )
+        _migration_restore_data(conn, data)
+        rev = db.get_revision(conn)
+    return {
+        "ok": True,
+        "restored": True,
+        "revision": rev,
+        "serial": data["published"]["serial"] if data["published"] is not None else None,
+        "counts": {table: len(data[table]) for table in _MIGRATION_TABLES},
     }
 
 
